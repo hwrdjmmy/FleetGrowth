@@ -1,0 +1,81 @@
+I need a process design management plan that explains how the calculations were performed to get the active asset count.
+The primary table that contains information on asset information is the [schema: database] [Asset.Asset]. This database contains information regarding when the vehicle was put into service, the make, model, production year, and other descriptive information regarding the vehicle. Because this table is live and there are several users that interact with the input of information, some aggregations of the table are time sensitive. One example of a time sensitive calculation would be the number of “active” assets within a fiscal year (FY). The reason this calculation is time sensitive is because if a vehicle gets added on day ‘X’ then obviously the count will change by 1 depending on when the aggregation count was performed, pre or post addition of vehicle on day ‘X’. Additionally, historically there have been instances when data cleanup was necessary and in that process some rows have been removed. A factor that can also affect counts is vehicle records are modified when a vehicle is moved from an active asset to a closed or retired asset. An example of this is an active asset status with show as “A” but once it is closed the status is changed to a “C” and there is not always a recorded value when the status changes. Another challenge with the data is Active assets are generally defined as a vehicle with a status code of (A,H,T,K) or (Active, Loaned, To Retire, and Keep) and are within the organization (001, 002) or (Transportation Owned, Retired). Historically, this definition has been a baseline for most calculations but because there are various business questions, this definition may differ slightly by analysis. This causes an issue when looking back at historical information and trying to deduce what the actual count is of active assets. An issue that is commonly experience for the analytics team in transportation is providing a count of active assets by a time frame. What this document intends to do is provide detailed information on how to calculate active assets for future applications as well as establish an agreed quantity on historical information.
+DROP TABLE IF EXISTS #Outserv;
+DROP TABLE IF EXISTS #Addserv;
+DROP TABLE IF EXISTS #setup;
+
+/* Get a count of the number of vehicles that were taken out of the fleet */
+/* out of service is the timeframe of interest as we want to understand usable vehicles.
+    Out of service is defined as "no longer being utilized", our interest in the number of
+    (A,H,T,K) on the last day of the FY */
+SELECT CASE WHEN MONTH(OutServiceDate) >= 5 THEN YEAR(OutServiceDate) + 1 ELSE YEAR(OutServiceDate) END AS FY,
+        count(OutServiceDate) as OutServiceDate
+into #Outserv
+from asset.asset a
+left join asset.Dispose d on a.AssetID = d.AssetID
+where a.AssetOrganization in ('001','002')
+GROUP BY CASE WHEN MONTH(DisposeDate) >= 5 THEN YEAR(DisposeDate) + 1 ELSE YEAR(DisposeDate) END
+
+
+/* Get a count of the number of vehicles that were additions to the fleet */
+SELECT CASE WHEN MONTH(InServiceDate) >= 5 THEN YEAR(InServiceDate) + 1 ELSE YEAR(InServiceDate) END AS FY,
+        count(InServiceDate) as InServiceDate,
+        count(CASE WHEN TRY_CAST(ReplacedAssetNumber AS FLOAT) IS NULL THEN 1 end) as Adds
+into #Addserv
+from asset.asset a
+left join asset.Dispose d on a.AssetID = d.AssetID
+WHERE YEAR(InServiceDate) > 2013 and  a.AssetOrganization in ('001','002')
+GROUP BY CASE WHEN MONTH(InServiceDate) >= 5 THEN YEAR(InServiceDate) + 1 ELSE YEAR(InServiceDate) END
+
+/* The below table is a stored procedure that takes a snapshot of the asset.asset table on each day.
+    This will show that there are 2,674 assets given the where condition on 4/30/26 */
+
+select count(*)
+from dbo.JMH_dailyrecord
+where AssetOrganization in ('001','002') and  assetstatus in ('A','H','T','K')
+    AND date_record >= '2026-04-30'
+    AND date_record <  '2026-05-01'
+
+select a.FY, b.InServiceDate as Total_Inservice,
+    a.OutServiceDate,  InServiceDate - OutServiceDate as Delta, 
+        case when a.FY = 2026 then 2674 else null end as FY_Total
+into #setup
+from #Outserv a 
+left join #Addserv b on a.FY = b.FY
+where a.FY > 2013
+order by FY desc;
+
+
+
+WITH ordered AS (
+    SELECT *
+    FROM #setup
+),
+cte AS (
+    -- Anchor (starting point)
+    SELECT FY, Total_Inservice, OutServiceDate, Delta, FY_Total
+    FROM ordered
+    WHERE FY = 2026
+    UNION ALL
+    -- Walk backward year by year
+    SELECT s.FY, s.Total_Inservice, s.OutServiceDate, s.Delta,
+           c.FY_Total - c.Delta AS FY_Total
+    FROM ordered s
+    JOIN cte c ON s.FY = c.FY - 1
+)
+SELECT *
+FROM cte
+ORDER BY FY DESC;
+SQL YoY Change	FY	SQL	Calculated	Old Reports	Growth Factor	106.2%
+	2016	2518	2,309	2,309	Required Growth	1.15807709
+-0.9%	2017	2495	2308	2,379	Adjustment	1.090515375
+1.0%	2018	2520	2351	2,377	Annual Scale Factor	1.008702691
+0.4%	2019	2530	2381	2,422		
+0.4%	2020	2540	2411	2,448		
+1.2%	2021	2570	2461	2,474	Growth Factor	=PRODUCT(1+A3:A12)
+-1.3%	2022	2537	2451	2,443	Required Growth	=C12/E2
+-2.0%	2023	2485	2422	2,443	Adjustment	=G2/G1
+1.3%	2024	2517	2475	2,497	Annual Scale Factor	=G3^(1/10)
+3.5%	2025	2604	2583	2,604		
+2.7%	2026	2674	2676	2,649		
+=(C3-C2)/C2			=ROUND(D2*(1+A3)*$G$4,0)
