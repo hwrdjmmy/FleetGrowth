@@ -1,0 +1,132 @@
+WITH fy_calendar AS (
+    SELECT 2025 AS FY, 
+           CAST('2024-05-01' AS date) AS FY_Start,
+           CAST('2025-04-30' AS date) AS FY_End
+    UNION ALL
+    SELECT 2026 AS FY, 
+           CAST('2025-05-01' AS date) AS FY_Start,
+           CAST('2026-04-30' AS date) AS FY_End
+),
+
+fy_miles AS (
+    SELECT
+        m.AssetID,
+        m.FY,
+        SUM(CASE 
+                WHEN TRY_CAST(m.MonthlyReading AS FLOAT) > 0 
+                THEN TRY_CAST(m.MonthlyReading AS FLOAT)
+                ELSE 0 
+            END) AS FY_Miles
+    FROM MileageTable m
+    WHERE m.FY IN (2025, 2026)
+    GROUP BY m.AssetID, m.FY
+),
+
+asset_year_status AS (
+    SELECT
+        a.AssetID,
+        c.FY,
+        c.FY_Start,
+        c.FY_End,
+        a.InServiceDate,
+        d.OutServiceDate,
+
+        CASE
+            WHEN a.InServiceDate <= c.FY_Start
+             AND (d.OutServiceDate IS NULL OR d.OutServiceDate > c.FY_End)
+            THEN 1
+            ELSE 0
+        END AS Active_Full_FY,
+
+        CASE
+            WHEN a.InServiceDate <= c.FY_End
+             AND (d.OutServiceDate IS NULL OR d.OutServiceDate >= c.FY_Start)
+            THEN 1
+            ELSE 0
+        END AS Active_Anytime_FY
+
+    FROM asset.asset a
+    CROSS JOIN fy_calendar c
+    LEFT JOIN asset.Dispose d
+        ON a.AssetID = d.AssetID
+    WHERE a.AssetOrganization IN ('001','002')
+),
+
+combined AS (
+    SELECT
+        s.AssetID,
+        s.FY,
+        s.Active_Full_FY,
+        s.Active_Anytime_FY,
+        COALESCE(m.FY_Miles, 0) AS FY_Miles
+    FROM asset_year_status s
+    LEFT JOIN fy_miles m
+        ON s.AssetID = m.AssetID
+       AND s.FY = m.FY
+),
+
+pivoted AS (
+    SELECT
+        AssetID,
+
+        MAX(CASE WHEN FY = 2025 THEN Active_Full_FY END) AS Active_Full_FY2025,
+        MAX(CASE WHEN FY = 2026 THEN Active_Full_FY END) AS Active_Full_FY2026,
+
+        MAX(CASE WHEN FY = 2025 THEN Active_Anytime_FY END) AS Active_Anytime_FY2025,
+        MAX(CASE WHEN FY = 2026 THEN Active_Anytime_FY END) AS Active_Anytime_FY2026,
+
+        SUM(CASE WHEN FY = 2025 THEN FY_Miles ELSE 0 END) AS Miles_FY2025,
+        SUM(CASE WHEN FY = 2026 THEN FY_Miles ELSE 0 END) AS Miles_FY2026
+    FROM combined
+    GROUP BY AssetID
+)
+
+SELECT
+    AssetID,
+    Miles_FY2025,
+    Miles_FY2026,
+    Miles_FY2026 - Miles_FY2025 AS Mileage_Change,
+    Active_Full_FY2025,
+    Active_Full_FY2026,
+    Active_Anytime_FY2025,
+    Active_Anytime_FY2026,
+
+    CASE
+        WHEN Active_Full_FY2025 = 1 
+         AND Active_Full_FY2026 = 1
+         AND Miles_FY2025 > 0 
+         AND Miles_FY2026 > 0
+        THEN 'Same Vehicle - Full Year Both FYs'
+
+        WHEN Active_Anytime_FY2025 = 1
+         AND Active_Anytime_FY2026 = 1
+         AND (Active_Full_FY2025 = 0 OR Active_Full_FY2026 = 0)
+        THEN 'Same Vehicle - Partial Year'
+
+        WHEN Active_Anytime_FY2025 = 0
+         AND Active_Anytime_FY2026 = 1
+         AND Active_Full_FY2026 = 1
+        THEN 'New FY2026 Full-Year Contributor'
+
+        WHEN Active_Anytime_FY2025 = 0
+         AND Active_Anytime_FY2026 = 1
+         AND Active_Full_FY2026 = 0
+        THEN 'New FY2026 Partial-Year Contributor'
+
+        WHEN Active_Anytime_FY2025 = 1
+         AND Active_Anytime_FY2026 = 0
+        THEN 'Dropped FY2026 Contributor'
+
+        WHEN Active_Anytime_FY2026 = 1
+         AND Active_Full_FY2026 = 0
+         AND Miles_FY2026 > 0
+        THEN 'Retired During FY2026'
+
+        WHEN Miles_FY2025 = 0
+         AND Miles_FY2026 = 0
+        THEN 'No Mileage'
+
+        ELSE 'Other / Review'
+    END AS Contribution_Type
+
+FROM pivoted;
